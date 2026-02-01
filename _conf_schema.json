@@ -1,0 +1,22 @@
+{
+    "server": {
+        "description": "监听服务器",
+        "type": "string",
+        "hint": "请输入服务器地址"
+    },
+    "client_token": {
+        "description": "Client Token",
+        "type": "string",
+        "hint": "请输入 Client Token"
+    },
+    "application": {
+        "description": "Application",
+        "type": "list",
+        "hint": "请输入要监听的 Application, 留空则监听全部."
+    },
+    "chat_id": {
+        "description": "会话 ID",
+        "type": "list",
+        "hint": "推送的会话 ID, 可以推送多个."
+    }
+}
