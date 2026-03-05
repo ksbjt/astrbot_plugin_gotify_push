@@ -13,7 +13,7 @@ from astrbot.core.message.message_event_result import MessageChain
     "astrbot_plugin_gotify_push",
     "ksbjt",
     "监听 Gotify 消息并推送",
-    "1.1.1",
+    "1.1.2",
 )
 class MyPlugin(Star):
     STORAGE_KEY = "umo_app_subscriptions"
@@ -76,6 +76,20 @@ class MyPlugin(Star):
         await self.put_kv_data(self.STORAGE_KEY, payload)
 
     @staticmethod
+    def build_app_identifiers(app_id: str, app_info: Dict) -> Set[str]:
+        identifiers = {app_id}
+
+        app_name = app_info.get("name")
+        if isinstance(app_name, str) and app_name.strip():
+            identifiers.add(app_name.strip())
+
+        app_token = app_info.get("token")
+        if isinstance(app_token, str) and app_token.strip():
+            identifiers.add(app_token.strip())
+
+        return identifiers
+
+    @staticmethod
     def parse_command_args(event: AstrMessageEvent) -> List[str]:
         message_str = (event.message_str or "").strip()
         if not message_str:
@@ -117,11 +131,12 @@ class MyPlugin(Star):
             logger.info(f"appid {app_id} 对应应用缺少 name")
             return
 
+        app_identifiers = self.build_app_identifiers(app_id, app_info)
         async with self.subscriptions_lock:
             target_umos = [
                 umo
                 for umo, apps in self.umo_app_subscriptions.items()
-                if app_name in apps
+                if apps.intersection(app_identifiers)
             ]
 
         if not target_umos:
@@ -161,13 +176,13 @@ class MyPlugin(Star):
 
         args = self.parse_command_args(event)
         if len(args) < 2:
-            yield event.plain_result("用法: /gotify_add <umo> <app>")
+            yield event.plain_result("用法: /gotify_add <umo> <app|appid|token>")
             return
 
         umo = args[0].strip()
         app = " ".join(args[1:]).strip()
         if not umo or not app:
-            yield event.plain_result("用法: /gotify_add <umo> <app>")
+            yield event.plain_result("用法: /gotify_add <umo> <app|appid|token>")
             return
 
         async with self.subscriptions_lock:
