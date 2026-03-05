@@ -13,7 +13,7 @@ from astrbot.core.message.message_event_result import MessageChain
     "astrbot_plugin_gotify_push",
     "ksbjt",
     "监听 Gotify 消息并推送",
-    "1.2.2",
+    "1.2.3",
 )
 class MyPlugin(Star):
     STORAGE_KEY = "umo_app_subscriptions"
@@ -108,34 +108,50 @@ class MyPlugin(Star):
             return f"token: {app_token}"
         return cls.normalize_text(fallback)
 
-    def resolve_application_in_cache(
+    def find_application_matches_in_cache(
         self, identifier: str
-    ) -> Tuple[Optional[str], Optional[Dict], str]:
+    ) -> Tuple[List[Tuple[str, Dict]], str]:
         normalized_identifier = self.normalize_text(identifier)
         if not normalized_identifier:
-            return None, None, ""
+            return [], ""
 
+        token_matches: List[Tuple[str, Dict]] = []
         for app_id, app_info in self.cache_app.items():
             app_token = self.normalize_text(app_info.get("token"))
             if app_token and normalized_identifier == app_token:
-                return app_id, app_info, "token"
+                token_matches.append((app_id, app_info))
+        if token_matches:
+            return token_matches, "token"
 
+        name_matches: List[Tuple[str, Dict]] = []
         for app_id, app_info in self.cache_app.items():
             app_name = self.normalize_text(app_info.get("name"))
             if app_name and normalized_identifier == app_name:
-                return app_id, app_info, "name"
+                name_matches.append((app_id, app_info))
+        if name_matches:
+            return name_matches, "name"
 
-        return None, None, ""
+        return [], ""
 
-    async def resolve_application_by_identifier(
+    async def resolve_application_matches(
+        self, identifier: str
+    ) -> Tuple[List[Tuple[str, Dict]], str]:
+        matches, matched_by = self.find_application_matches_in_cache(identifier)
+        if matches:
+            return matches, matched_by
+
+        if await self.update_applications():
+            return self.find_application_matches_in_cache(identifier)
+        return [], ""
+
+    def resolve_application_in_cache(
         self, identifier: str
     ) -> Tuple[Optional[str], Optional[Dict], str]:
-        app_id, app_info, matched_by = self.resolve_application_in_cache(identifier)
-        if app_id:
-            return app_id, app_info, matched_by
-
-        await self.update_applications()
-        return self.resolve_application_in_cache(identifier)
+        matches, matched_by = self.find_application_matches_in_cache(identifier)
+        if not matches:
+            return None, None, ""
+        app_id, app_info = matches[0]
+        return app_id, app_info, matched_by
 
     def format_subscription_values(self, values: List[str]) -> List[str]:
         formatted_values: List[str] = []
@@ -281,30 +297,51 @@ class MyPlugin(Star):
             yield event.plain_result("用法: /gotify_add <umo> <app|token>")
             return
 
-        _, resolved_app_info, _ = await self.resolve_application_by_identifier(app)
-        if not resolved_app_info:
+        matched_apps, _ = await self.resolve_application_matches(app)
+        if not matched_apps:
             yield event.plain_result("未找到应用，请填写 app name 或 app token")
             return
 
-        store_value = self.normalize_text(resolved_app_info.get("token"))
-        if not store_value:
-            yield event.plain_result("该应用未返回 token，无法添加订阅")
+        token_display_map: Dict[str, str] = {}
+        for _, app_info in matched_apps:
+            token = self.normalize_text(app_info.get("token"))
+            if not token:
+                continue
+            token_display_map[token] = self.format_app_display(app_info, fallback=token)
+
+        target_tokens = sorted(token_display_map.keys())
+        if not target_tokens:
+            yield event.plain_result("匹配到的应用都未返回 token，无法添加订阅")
             return
-        display_target = self.format_app_display(resolved_app_info, fallback=store_value)
 
         async with self.subscriptions_lock:
             apps = self.umo_app_subscriptions.setdefault(umo, set())
-            existed = store_value in apps
-            apps.add(store_value)
-            await self.save_subscriptions_locked()
+            existed_tokens = [token for token in target_tokens if token in apps]
+            new_tokens = [token for token in target_tokens if token not in apps]
+            if new_tokens:
+                apps.update(new_tokens)
+                await self.save_subscriptions_locked()
             app_count = len(apps)
 
-        if existed:
-            yield event.plain_result(f"该应用已添加: {umo} -> {display_target}")
+        if not new_tokens:
+            if len(target_tokens) == 1:
+                display_target = token_display_map[target_tokens[0]]
+                yield event.plain_result(f"该应用已被添加: {umo} -> {display_target}")
+            else:
+                yield event.plain_result(
+                    f"该应用已被添加: {umo} -> {app}\n共 {len(target_tokens)} 个 token 已存在"
+                )
+            return
+
+        if len(target_tokens) == 1:
+            display_target = token_display_map[target_tokens[0]]
+            yield event.plain_result(
+                f"添加成功: {umo} -> {display_target}\n当前该 UMO 共监听 {app_count} 个应用"
+            )
             return
 
         yield event.plain_result(
-            f"添加成功: {umo} -> {display_target}\n当前该 UMO 共监听 {app_count} 个应用"
+            f"添加成功: {umo} -> {app}\n本次新增 {len(new_tokens)} 个 token，已存在 {len(existed_tokens)} 个\n当前该 UMO 共监听 {app_count} 个应用"
         )
 
     @filter.command("gotify_del")
@@ -323,9 +360,22 @@ class MyPlugin(Star):
         result_message = ""
         removed_all = False
         remove_display = app
+        remove_candidates = set()
+        removed_token_count = 0
 
         if app:
             await self.update_applications()
+            matched_apps, _ = self.find_application_matches_in_cache(app)
+            remove_candidates.add(app)
+            for _, app_info in matched_apps:
+                token = self.normalize_text(app_info.get("token"))
+                if token:
+                    remove_candidates.add(token)
+
+            if len(matched_apps) == 1:
+                remove_display = self.format_app_display(
+                    matched_apps[0][1], fallback=app
+                )
 
         async with self.subscriptions_lock:
             apps = self.umo_app_subscriptions.get(umo)
@@ -336,22 +386,13 @@ class MyPlugin(Star):
                 await self.save_subscriptions_locked()
                 result_message = f"已删除 UMO {umo} 的全部订阅"
             else:
-                _, resolved_app_info, _ = self.resolve_application_in_cache(app)
-                remove_candidates = {app}
-                if resolved_app_info:
-                    remove_display = self.format_app_display(
-                        resolved_app_info, fallback=app
-                    )
-                    remove_candidates.update(self.build_app_identifiers(resolved_app_info))
-                    store_value = self.normalize_text(resolved_app_info.get("token"))
-                    if store_value:
-                        remove_candidates.add(store_value)
-
-                remove_key = next((item for item in remove_candidates if item in apps), "")
-                if not remove_key:
+                removed_tokens = [item for item in remove_candidates if item in apps]
+                if not removed_tokens:
                     result_message = f"UMO {umo} 未订阅应用: {remove_display}"
                 else:
-                    apps.remove(remove_key)
+                    removed_token_count = len(removed_tokens)
+                    for removed_token in removed_tokens:
+                        apps.remove(removed_token)
                     if not apps:
                         del self.umo_app_subscriptions[umo]
                         removed_all = True
@@ -362,8 +403,19 @@ class MyPlugin(Star):
             return
 
         if removed_all:
+            if removed_token_count > 1:
+                yield event.plain_result(
+                    f"已删除订阅: {umo} -> {remove_display}\n本次共删除 {removed_token_count} 个 token\n该 UMO 已无任何订阅并自动移除"
+                )
+                return
             yield event.plain_result(
                 f"已删除订阅: {umo} -> {remove_display}\n该 UMO 已无任何订阅并自动移除"
+            )
+            return
+
+        if removed_token_count > 1:
+            yield event.plain_result(
+                f"已删除订阅: {umo} -> {remove_display}\n本次共删除 {removed_token_count} 个 token"
             )
             return
 
