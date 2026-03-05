@@ -13,7 +13,7 @@ from astrbot.core.message.message_event_result import MessageChain
     "astrbot_plugin_gotify_push",
     "ksbjt",
     "监听 Gotify 消息并推送",
-    "1.2.1",
+    "1.2.2",
 )
 class MyPlugin(Star):
     STORAGE_KEY = "umo_app_subscriptions"
@@ -31,17 +31,18 @@ class MyPlugin(Star):
         self.umo_app_subscriptions: Dict[str, Set[str]] = {}
         self.subscriptions_lock = asyncio.Lock()
 
-    async def update_applications(self):
+    async def update_applications(self) -> bool:
         try:
             applications = await self.gotify.get_applications()
         except Exception as e:
             logger.error(f"刷新 Gotify 应用列表失败: {e}")
-            return
+            return False
         self.cache_app = {
             str(app.get("id")): app
             for app in applications
             if isinstance(app, dict) and "id" in app
         }
+        return True
 
     async def load_subscriptions(self):
         raw_data = await self.get_kv_data(self.STORAGE_KEY, {})
@@ -153,6 +154,30 @@ class MyPlugin(Star):
 
         return formatted_values
 
+    async def cleanup_deleted_subscriptions(self) -> int:
+        known_tokens = {
+            self.normalize_text(app.get("token"))
+            for app in self.cache_app.values()
+            if self.normalize_text(app.get("token"))
+        }
+        if not known_tokens:
+            return 0
+
+        removed_count = 0
+        async with self.subscriptions_lock:
+            for umo, app_tokens in list(self.umo_app_subscriptions.items()):
+                remaining = {token for token in app_tokens if token in known_tokens}
+                removed_count += len(app_tokens) - len(remaining)
+                if remaining:
+                    self.umo_app_subscriptions[umo] = remaining
+                else:
+                    del self.umo_app_subscriptions[umo]
+
+            if removed_count > 0:
+                await self.save_subscriptions_locked()
+
+        return removed_count
+
     @staticmethod
     def parse_command_args(event: AstrMessageEvent) -> List[str]:
         message_str = (event.message_str or "").strip()
@@ -169,7 +194,10 @@ class MyPlugin(Star):
 
     async def initialize(self):
         await self.load_subscriptions()
-        await self.update_applications()
+        if await self.update_applications():
+            removed_count = await self.cleanup_deleted_subscriptions()
+            if removed_count > 0:
+                logger.info(f"已自动清理 {removed_count} 条失效订阅(token)")
         self.listen_task = asyncio.create_task(self.start_listen())
         logger.info(
             f"插件初始化完成, 已加载 {len(self.umo_app_subscriptions)} 个 UMO 订阅"
@@ -364,7 +392,10 @@ class MyPlugin(Star):
             yield event.plain_result("用法: /gotify_list [umo]")
             return
 
-        await self.update_applications()
+        removed_count = 0
+        if await self.update_applications():
+            removed_count = await self.cleanup_deleted_subscriptions()
+
         async with self.subscriptions_lock:
             snapshot = {
                 umo: sorted(apps)
@@ -378,6 +409,8 @@ class MyPlugin(Star):
                 return
 
             lines = ["当前全部 UMO 订阅:"]
+            if removed_count > 0:
+                lines.append(f"已自动清理失效订阅: {removed_count} 条")
             for idx, umo in enumerate(sorted(snapshot.keys()), start=1):
                 lines.append(f"{idx}. UMO: {umo}")
                 display_values = self.format_subscription_values(snapshot[umo])
@@ -392,7 +425,10 @@ class MyPlugin(Star):
             yield event.plain_result(f"未找到 UMO: {umo}")
             return
 
-        lines = [f"UMO: {umo}", "监听应用:"]
+        lines = [f"UMO: {umo}"]
+        if removed_count > 0:
+            lines.append(f"已自动清理失效订阅: {removed_count} 条")
+        lines.append("监听应用:")
         display_values = self.format_subscription_values(apps)
         for idx, display in enumerate(display_values, start=1):
             lines.append(f"{idx}. {display}")
